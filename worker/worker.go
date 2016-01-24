@@ -194,7 +194,8 @@ func RunTask(task *remote_worker.Task) {
 	}
 
 	// run Bot on Project
-	botCmd := exec.Command("docker", "run", "--rm", "-v",
+	botCmd := exec.Command("docker", "run", "--rm", "-ti", "--memory=\"128m\"", 
+		"--cpuset-cpus=\"1\"", "-v",
 		fmt.Sprintf("%s:/%s:ro", directory, path), task.Bot, path)
 	cancleChn := make(chan bool)
 	abortChn := make(chan bool)
