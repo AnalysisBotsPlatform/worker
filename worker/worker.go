@@ -16,6 +16,9 @@ import (
 // Directory (within the cache directory) where projects are found.
 const projects_directory = "projects"
 
+// TODO document this
+const patches_directory = "patches"
+
 // Directory where the application can store temporary data on the file system.
 var cache_directory string
 
@@ -130,6 +133,23 @@ func RunTask(task *remote_worker.Task) {
 		}
 	}
 
+	if task.Patch {
+		dir := fmt.Sprintf("%s/%s/%d", cache_directory, patches_directory,
+			task.Id)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
+					Tid:         task.Id,
+					Stdout:      "",
+					Stderr:      "Cannot create patches cache directory!",
+					Exit_status: -1,
+				}, &ack)
+				<-cancel
+				return
+			}
+		}
+	}
+
 	// fetch Bot from DockerHub
 	dockerPullCmd := exec.Command("docker", "pull", task.Bot)
 	if output, err := dockerPullCmd.CombinedOutput(); err != nil {
@@ -194,9 +214,17 @@ func RunTask(task *remote_worker.Task) {
 	}
 
 	// run Bot on Project
-	botCmd := exec.Command("docker", "run", "--rm", "-ti", "--memory=\"128m\"", 
-		"--cpuset-cpus=\"1\"", "-v",
-		fmt.Sprintf("%s:/%s:ro", directory, path), task.Bot, path)
+	var botCmd *exec.Cmd
+	if task.Patch {
+		botCmd = exec.Command("docker", "run", "--rm", "--memory=\"128m\"",
+			"--cpuset-cpus=\"1\"", "-v", fmt.Sprintf("%s:/%s:ro", directory,
+				path), "-v", fmt.Sprintf("%s/%s/%d:/patch", cache_directory,
+				patches_directory, task.Id), task.Bot, path, "/patch")
+	} else {
+		botCmd = exec.Command("docker", "run", "--rm", "--memory=\"128m\"",
+			"--cpuset-cpus=\"1\"", "-v", fmt.Sprintf("%s:/%s:ro", directory,
+				path), task.Bot, path)
+	}
 	cancleChn := make(chan bool)
 	abortChn := make(chan bool)
 	execChn := make(chan bool)
@@ -219,11 +247,22 @@ func RunTask(task *remote_worker.Task) {
 		// nop
 	case <-execChn:
 		abortChn <- true
+		var patch_content string
+		if task.Patch {
+			in, err := ioutil.ReadFile(fmt.Sprintf("%s/%s/%d/changes.patch",
+				cache_directory, patches_directory, task.Id))
+			if err == nil {
+				patch_content = string(in)
+				os.RemoveAll(fmt.Sprintf("%s/%s/%d", cache_directory,
+					patches_directory, task.Id))
+			}
+		}
 		conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
 			Tid:         task.Id,
 			Stdout:      out,
 			Stderr:      err,
 			Exit_status: exit_code,
+			Patch:       patch_content,
 		}, &ack)
 	}
 }
