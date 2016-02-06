@@ -3,7 +3,6 @@ package worker
 
 import (
 	"fmt"
-	"github.com/AnalysisBotsPlatform/platform/utils"
 	remote_worker "github.com/AnalysisBotsPlatform/platform/worker"
 	"io"
 	"io/ioutil"
@@ -16,53 +15,37 @@ import (
 
 // Directory (within the cache directory) where projects are found.
 const projects_directory = "projects"
+const project = "/project"
 
-// TODO document this
+// Directory (within the cache directory) where patch files are found.
 const patches_directory = "patches"
+const patch = "/patch"
+
+// Docker container resource limits.
+const max_memory = "128m"
+const max_cpus = "1"
 
 // Directory where the application can store temporary data on the file system.
 var cache_directory string
 
 // Length of the directory names for the cloned GitHub projects.
-// NOTE: If the project gets many users, this number should be raised.
+// NOTE: If the platform gets many users, this number should be raised.
 const directory_length = 8
 
-// TODO document this
+// Connection to the Worker controller
 var conn *rpc.Client
 
-// TODO document this
-var cancel chan bool
-
-// Initialization of the worker. Sets up the channel store and the cache
-// directory is set.
+// Initialization of the worker. Sets up the cancelation channel, the cache
+// directory is set and the connection is saved.
 func Init(path_to_cache string, connection *rpc.Client) {
 	cache_directory = path_to_cache
 	conn = connection
-	cancel = make(chan bool, 1)
-}
-
-// Cancels the running task specified by the given task id using the channel.
-// Also updates the database entry accordingly.
-// func Cancle(tid string) error {
-// TODO document this
-func Cancle() {
-	cancel <- true
-}
-
-// Checks if the task was canceled.
-func checkForCanclation() bool {
-	select {
-	case <-cancel:
-		return true
-	default:
-		return false
-	}
 }
 
 // Waits on the channel for a cancelation action. If such an action is received,
 // the corresponding process is terminated (Docker container) and the `execBot`
 // function is able to continue its execution.
-func waitForCanclation(returnChn, abortWait chan bool, cmd *exec.Cmd) {
+func waitForCanclation(returnChn, abortWait, cancel chan bool, cmd *exec.Cmd) {
 	select {
 	case <-cancel:
 		cmd.Process.Kill()
@@ -94,140 +77,51 @@ func execBot(returnChn chan bool, cmd *exec.Cmd, stdout, stderr io.ReadCloser,
 	returnChn <- true
 }
 
-// Cleans up the project cache, i.e. the cloned project is removed from file
-// system.
-func cleanProjectCache(directory string) {
-	rmDirectoryCmd := exec.Command("rm", "-rf", directory)
-	if err := rmDirectoryCmd.Run(); err != nil {
-		fmt.Println(err)
-	}
-}
-
-// Preperation steps:
-// - Creates the project cache directory if nesessary.
-// - Fetches the bot from DockerHub.
-// General:
-// - Creates a new clone of the repository.
-// NOTE: Later this may be changed to a pull instead of clone, i.e. a cloned
-// repository is reused.
-// - The Bot is executed on the cloned project. This includes the creation of a
-// new Docker container from the Bot's Docker image.
-// - Waits for completion of the Bot's execution.
-// - Cleans up project cache directory (removes clone).
-// - Publishes results accordingly (this includes exit status and output)
-// TODO documentation
-func RunTask(task *remote_worker.Task) {
+// Run the Bot on the Project.
+func run(task *remote_worker.Task, cancel chan bool,
+	project_path, patch_path string) {
+	var botCmdArgs []string
 	var ack bool
 
-	// create project cache directory if necessary
-	dir := fmt.Sprintf("%s/%s", cache_directory, projects_directory)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.Mkdir(dir, 0755); err != nil {
-			conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
-				Tid:         task.Id,
-				Stdout:      "",
-				Stderr:      "Cannot create project cache directory!",
-				Exit_status: -1,
-			}, &ack)
-			<-cancel
-			return
-		}
-	}
+	botCmdArgs = append(botCmdArgs, "run")
+	// remove container after execution
+	botCmdArgs = append(botCmdArgs, "--rm")
+	// memory limit
+	botCmdArgs = append(botCmdArgs, fmt.Sprintf("--memory=\"%s\"", max_memory))
+	// cpu limit
+	botCmdArgs = append(botCmdArgs, fmt.Sprintf("--cpuset-cpus=\"%s\"",
+		max_cpus))
+	// mount cloned project into container (read-only)
+	botCmdArgs = append(botCmdArgs, "-v", fmt.Sprintf("%s:%s:ro", project_path,
+		project))
 
 	if task.Patch {
-		dir := fmt.Sprintf("%s/%s/%d", cache_directory, patches_directory,
-			task.Id)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
-					Tid:         task.Id,
-					Stdout:      "",
-					Stderr:      "Cannot create patches cache directory!",
-					Exit_status: -1,
-				}, &ack)
-				<-cancel
-				return
-			}
-		}
-	}
-
-	// fetch Bot from DockerHub
-	dockerPullCmd := exec.Command("docker", "pull", task.Bot)
-	if output, err := dockerPullCmd.CombinedOutput(); err != nil {
-		// NOTE This should not happen. Either docker is not available or the
-		// Bot was removed from the DockerHub. One might want to invalidate the
-		// Bot in case err is an ExitError.
-		err_msg := fmt.Sprintln(err)
-		err_msg = fmt.Sprintf("%s%s", err_msg, output)
-		conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
-			Tid:         task.Id,
-			Stdout:      "",
-			Stderr:      err_msg,
-			Exit_status: -1,
-		}, &ack)
-		<-cancel
-		return
-	}
-	if checkForCanclation() {
-		return
-	}
-
-	// NOTE reuse cloned project
-	directory := ""
-	path := ""
-	exists := true
-	for exists {
-		path = fmt.Sprintf("%s/%s", projects_directory,
-			utils.RandString(directory_length))
-		directory = fmt.Sprintf("%s/%s", cache_directory, path)
-		if _, err := os.Stat(directory); os.IsNotExist(err) {
-			if err := os.Mkdir(directory, 0755); err != nil {
-				conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
-					Tid:         task.Id,
-					Stdout:      "",
-					Stderr:      "Cannot create project target directory!",
-					Exit_status: -1,
-				}, &ack)
-				<-cancel
-				return
-			}
-			exists = false
-		}
-	}
-	gitPullCmd := exec.Command("git", "clone",
-		fmt.Sprintf("https://%s@github.com/%s.git", task.GH_token,
-			task.Project), directory)
-	if output, err := gitPullCmd.CombinedOutput(); err != nil {
-		err_msg := fmt.Sprintln(err)
-		err_msg = fmt.Sprintf("%s%s", err_msg, output)
-		conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
-			Tid:         task.Id,
-			Stdout:      "",
-			Stderr:      err_msg,
-			Exit_status: -1,
-		}, &ack)
-		<-cancel
-		return
-	}
-	defer cleanProjectCache(directory)
-	if checkForCanclation() {
-		return
-	}
-
-	// run Bot on Project
-	var botCmd *exec.Cmd
-	if task.Patch {
+		// mount writeable directory into container
+		// the patch file should be written therein
+		botCmdArgs = append(botCmdArgs, "-v", fmt.Sprintf("%s:%s", patch_path,
+			patch))
+		// set the user id within the container to match the user that
+		// executes the Worker
 		current_user, _ := user.Current()
-		botCmd = exec.Command("docker", "run", "--rm", "--memory=\"128m\"",
-			"--cpuset-cpus=\"1\"", "-v", fmt.Sprintf("%s:/%s:ro", directory,
-				path), "-v", fmt.Sprintf("%s/%s/%d:/patch", cache_directory,
-				patches_directory, task.Id), "-w", "/patch", "-u",
-			current_user.Uid, task.Bot, "/"+path, "/patch")
-	} else {
-		botCmd = exec.Command("docker", "run", "--rm", "--memory=\"128m\"",
-			"--cpuset-cpus=\"1\"", "-v", fmt.Sprintf("%s:/%s:ro", directory,
-				path), task.Bot, path)
+		botCmdArgs = append(botCmdArgs, "-u", current_user.Uid)
 	}
+
+	// Docker images that gets executed
+	botCmdArgs = append(botCmdArgs, task.Bot)
+	// 1st argument for the container (directory where the project clone
+	// is located)
+	botCmdArgs = append(botCmdArgs, project)
+
+	if task.Patch {
+		// 2nd argument for the container (file where the Git patch should be
+		// written to)
+		botCmdArgs = append(botCmdArgs, fmt.Sprintf("%s/changes.patch", patch))
+	}
+
+	// use "docker run" to execute the Bot
+	botCmd := exec.Command("docker", botCmdArgs...)
+
+	// channels used to synchronize
 	cancleChn := make(chan bool)
 	abortChn := make(chan bool)
 	execChn := make(chan bool)
@@ -235,29 +129,31 @@ func RunTask(task *remote_worker.Task) {
 	defer close(abortChn)
 	defer close(execChn)
 
+	// start Bot
 	stdout, _ := botCmd.StdoutPipe()
 	stderr, _ := botCmd.StderrPipe()
 	botCmd.Start()
 	conn.Call("WorkerAPI.PublishTaskStarted", task, &ack)
 
+	// wait for termination or cancelation
 	out := ""
 	err := ""
 	exit_code := 0
-	go waitForCanclation(cancleChn, abortChn, botCmd)
+	go waitForCanclation(cancleChn, abortChn, cancel, botCmd)
 	go execBot(execChn, botCmd, stdout, stderr, &out, &err, &exit_code)
+
 	select {
 	case <-cancleChn:
 		// nop
 	case <-execChn:
 		abortChn <- true
+
+		// publish result
 		var patch_content string
 		if task.Patch {
-			in, err := ioutil.ReadFile(fmt.Sprintf("%s/%s/%d/changes.patch",
-				cache_directory, patches_directory, task.Id))
-			if err == nil {
+			if in, err := ioutil.ReadFile(fmt.Sprintf("%s/changes.patch",
+				patch_path)); err == nil {
 				patch_content = string(in)
-				os.RemoveAll(fmt.Sprintf("%s/%s/%d", cache_directory,
-					patches_directory, task.Id))
 			}
 		}
 		conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
@@ -268,4 +164,112 @@ func RunTask(task *remote_worker.Task) {
 			Patch:       patch_content,
 		}, &ack)
 	}
+}
+
+// Try to create a directory in the cache directory. Cancel the task if this
+// fails.
+func createDirectoryOrCancelTask(path string, tid int64,
+	cancel chan bool) bool {
+	var ack bool
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
+				Tid:         tid,
+				Stdout:      "",
+				Stderr:      "Cannot create cache directory!",
+				Exit_status: -1,
+			}, &ack)
+			<-cancel
+			return false
+		}
+	}
+	return true
+}
+
+// Try run run a command. Cancel the task if this fails.
+func runCommandOrCancelTask(cmd *exec.Cmd, tid int64, cancel chan bool) bool {
+	var ack bool
+	if output, err := cmd.CombinedOutput(); err != nil {
+		err_msg := fmt.Sprintln(err)
+		err_msg = fmt.Sprintf("%s\n%s", err_msg, output)
+		conn.Call("WorkerAPI.PublishTaskResult", remote_worker.Result{
+			Tid:         tid,
+			Stdout:      "",
+			Stderr:      err_msg,
+			Exit_status: -1,
+		}, &ack)
+		<-cancel
+		return false
+	}
+	return true
+}
+
+// Preperation steps:
+// - Creates the project cache directory if nesessary.
+// - Fetches the Bot from DockerHub.
+// General:
+// - Creates a new clone of the repository.
+// NOTE: Later this may be changed to a pull instead of clone, i.e. a cloned
+// repository is reused.
+// - The Bot is executed on the cloned project. This includes the creation of a
+// new Docker container from the Bot's Docker image.
+// - Waits for completion of the Bot's execution.
+// - For Bot's that have a Git patch support the patch is read and appended to
+// the result data.
+// - Cleans up project cache directory (removes clone).
+// - Publishes results accordingly (this includes exit status and output)
+func RunTask(task *remote_worker.Task, cancel chan bool) {
+	// create project cache directory if necessary
+	project_path := fmt.Sprintf("%s/%s/%d", cache_directory, projects_directory,
+		task.Id)
+	if !createDirectoryOrCancelTask(project_path, task.Id, cancel) {
+		return
+	}
+	defer os.RemoveAll(project_path)
+
+	// create patch cache directory if necessary
+	var patch_path string
+	if task.Patch {
+		patch_path = fmt.Sprintf("%s/%s/%d", cache_directory, patches_directory,
+			task.Id)
+		if !createDirectoryOrCancelTask(patch_path, task.Id, cancel) {
+			return
+		}
+		defer os.RemoveAll(patch_path)
+	}
+
+	// fetch Bot from DockerHub
+	if !runCommandOrCancelTask(exec.Command("docker", "pull", task.Bot),
+		task.Id, cancel) {
+		// NOTE This should not happen. Either docker is not available or the
+		// Bot was removed from the DockerHub. One might want to invalidate the
+		// Bot in case err is an ExitError.
+		return
+	}
+	select {
+	case <-cancel:
+		return
+	default:
+	}
+
+	// clone project from GitHub and invalidate remote server
+	if !runCommandOrCancelTask(exec.Command("git", "clone",
+		fmt.Sprintf("https://%s@github.com/%s.git", task.GH_token,
+			task.Project), project_path), task.Id, cancel) {
+		return
+	} else {
+		cmd := exec.Command("git", "remote", "set-url", "origin", "0.0.0.0")
+		cmd.Dir = project_path
+		if !runCommandOrCancelTask(cmd, task.Id, cancel) {
+			return
+		}
+	}
+	select {
+	case <-cancel:
+		return
+	default:
+	}
+
+	// run Bot on Project
+	run(task, cancel, project_path, patch_path)
 }
