@@ -10,6 +10,7 @@ import (
 	"net/rpc"
 	"os"
 	"os/exec"
+	"os/user"
 	"syscall"
 )
 
@@ -216,10 +217,12 @@ func RunTask(task *remote_worker.Task) {
 	// run Bot on Project
 	var botCmd *exec.Cmd
 	if task.Patch {
+		current_user, _ := user.Current()
 		botCmd = exec.Command("docker", "run", "--rm", "--memory=\"128m\"",
 			"--cpuset-cpus=\"1\"", "-v", fmt.Sprintf("%s:/%s:ro", directory,
 				path), "-v", fmt.Sprintf("%s/%s/%d:/patch", cache_directory,
-				patches_directory, task.Id), task.Bot, path, "/patch")
+				patches_directory, task.Id), "-w", "/patch", "-u",
+			current_user.Uid, task.Bot, "/"+path, "/patch")
 	} else {
 		botCmd = exec.Command("docker", "run", "--rm", "--memory=\"128m\"",
 			"--cpuset-cpus=\"1\"", "-v", fmt.Sprintf("%s:/%s:ro", directory,
