@@ -254,8 +254,15 @@ func RunTask(task *remote_worker.Task, cancel chan bool) {
 
 	// clone project from GitHub and invalidate remote server
 	if !runCommandOrCancelTask(exec.Command("git", "clone",
+		// clone URL
 		fmt.Sprintf("https://%s@github.com/%s.git", task.GH_token,
-			task.Project), project_path), task.Id, cancel) {
+			task.Project),
+		// default branch
+		"--branch", "master",
+		// clone only default branch
+		"--single-branch",
+		// target directory
+		project_path), task.Id, cancel) {
 		return
 	} else {
 		cmd := exec.Command("git", "remote", "set-url", "origin", "0.0.0.0")
